@@ -1,0 +1,21 @@
+# Secrets and tokens
+*.toml
+!.streamlit/config.toml
+!.streamlit/secrets.toml.example
+*.json
+google_token.json
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.env
+.venv/
+env/
+venv/
+
+# OS / Editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
