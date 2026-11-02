@@ -1,4 +1,4 @@
-"""streamlit_app.py - High-Speed Apple Music Live Checker (Manual UPC Mode)."""
+"""streamlit_app.py - High-Speed Apple Music Live Checker (Exact UPC Match Only)."""
 
 import io
 import re
@@ -16,7 +16,7 @@ st.set_page_config(
     page_title="Apple Music Live Checker",
     page_icon="🎵",
     layout="wide",
-    initial_sidebar_state="expanded"
+    initial_sidebar_state="collapsed"
 )
 
 # Optional Password Gate (if app_password defined in st.secrets)
@@ -25,7 +25,7 @@ if hasattr(st, "secrets") and "app_password" in st.secrets:
         st.session_state["authenticated"] = False
 
     if not st.session_state["authenticated"]:
-        st.title("🔒 Apple Music Checker - Access Restricted")
+        st.title("🔒 Apple Music Checker — Access Restricted")
         col_pwd, _ = st.columns([1, 2])
         with col_pwd:
             input_pwd = st.text_input("Enter Access PIN / Password", type="password")
@@ -43,45 +43,10 @@ if "manual_results" not in st.session_state:
 if "pasted_text" not in st.session_state:
     st.session_state["pasted_text"] = ""
 
-# --- SIDEBAR CONFIGURATION ---
-with st.sidebar:
-    st.title("Settings")
-    
-    st.markdown("### Storefronts")
-    available_storefronts = {
-        "EG": "Egypt",
-        "SA": "Saudi Arabia",
-        "DZ": "Algeria",
-        "AE": "United Arab Emirates",
-        "US": "United States",
-        "FR": "France",
-        "GB": "United Kingdom",
-        "MA": "Morocco"
-    }
-    selected_storefronts = st.multiselect(
-        "Storefronts to Scan",
-        options=list(available_storefronts.keys()),
-        default=["EG", "US", "SA", "DZ", "AE"],
-        format_func=lambda code: f"{code} — {available_storefronts[code]}",
-        help="Checks catalog availability across selected storefronts"
-    )
-
-    st.markdown("### Performance")
-    max_concurrency = st.slider(
-        "Concurrent Workers",
-        min_value=2,
-        max_value=16,
-        value=8,
-        help="Number of parallel threads for Apple Music API lookup"
-    )
-
-    st.divider()
-    st.caption("Apple Music Live Checker • Manual UPC Mode")
-
 # --- APP HEADER ---
 st.title("🎵 Apple Music Live Checker")
 st.caption(
-    "Paste UPCs or upload a spreadsheet to instantly verify availability on Apple Music across global storefronts."
+    "Verify catalog delivery on Apple Music by **exact UPC match only**. Zero false positives, no fuzzy matching."
 )
 
 # --- INPUT SECTION ---
@@ -92,11 +57,10 @@ with st.container(border=True):
         st.markdown("##### Paste UPCs")
         st.caption("Enter UPCs (one per line, comma-separated, or pasted from Excel).")
 
-        # Action buttons row above text area
         col_s1, col_s2, _ = st.columns([1, 1, 1.5])
         with col_s1:
             if st.button("Load Samples", icon=":material/playlist_add:", width="stretch"):
-                # 3 sample UPCs: 1 delivered, 2 test/pending
+                # 4 sample UPCs: 3 known live, 1 pending
                 sample_upcs = "730170424336\n730170440831\n730170441074\n730170424701"
                 st.session_state["pasted_text"] = sample_upcs
                 st.rerun()
@@ -178,21 +142,19 @@ with col_run:
 
 with col_info:
     if parsed_items:
-        st.caption(f"Ready to check **{len(parsed_items)}** unique UPCs across **{len(selected_storefronts)}** storefronts.")
+        st.caption(f"Ready to check **{len(parsed_items)}** unique UPCs via exact lookup across storefronts.")
 
 if scan_clicked and parsed_items:
-    storefront_list = [s.lower() for s in selected_storefronts]
     scan_payload = [
         {
             "upc": it["upc"],
             "source": it.get("source", "Manual"),
-            "storefronts": storefront_list
+            "storefronts": checker_engine.DEFAULT_STOREFRONTS
         }
         for it in parsed_items
     ]
 
-    progress_bar = st.progress(0, text="Initiating scan...")
-    status_text = st.empty()
+    progress_bar = st.progress(0, text="Initiating exact UPC lookups...")
 
     def on_progress(done, total, item):
         pct = int((done / total) * 100)
@@ -201,12 +163,11 @@ if scan_clicked and parsed_items:
     start_t = time.time()
     results = checker_engine.batch_check_upcs(
         scan_payload,
-        max_workers=max_concurrency,
+        max_workers=8,
         progress_callback=on_progress
     )
     elapsed = round(time.time() - start_t, 2)
     progress_bar.empty()
-    status_text.empty()
 
     st.session_state["manual_results"] = {
         "items": results,
@@ -221,7 +182,6 @@ res_state = st.session_state.get("manual_results")
 if res_state:
     results_list = res_state["items"]
     elapsed_time = res_state["elapsed"]
-    scan_time = res_state["timestamp"]
 
     total = len(results_list)
     live_count = sum(1 for r in results_list if r.get("is_live"))
@@ -237,7 +197,7 @@ if res_state:
     with m1:
         st.metric("Total Checked", f"{total}")
     with m2:
-        st.metric("Live on Apple Music", f"{live_count}", delta=f"{live_pct}% Live", delta_color="normal")
+        st.metric("Live (Exact Match)", f"{live_count}", delta=f"{live_pct}% Live", delta_color="normal")
     with m3:
         st.metric("Not Live / Unavailable", f"{not_live_count}", delta=f"{round(100 - live_pct, 1)}%", delta_color="inverse")
     with m4:
@@ -272,9 +232,8 @@ if res_state:
             "Album": r.get("matched_album", ""),
             "Apple Music Link": r.get("apple_url", ""),
             "Storefront": r.get("storefront", ""),
-            "Copyright": r.get("copyright", ""),
             "Release Date": r.get("release_date", ""),
-            "Method": r.get("method", "")
+            "Copyright": r.get("copyright", "")
         })
 
     df_display = pd.DataFrame(filtered_rows)
@@ -302,6 +261,10 @@ if res_state:
                 ),
                 "Artist": st.column_config.TextColumn(
                     "Artist",
+                    width="medium"
+                ),
+                "Album": st.column_config.TextColumn(
+                    "Album",
                     width="medium"
                 ),
                 "Apple Music Link": st.column_config.LinkColumn(
@@ -335,7 +298,7 @@ if res_state:
             st.download_button(
                 label="Download CSV",
                 data=csv_buf.getvalue(),
-                file_name=f"apple_music_checker_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                file_name=f"apple_music_exact_matches_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
                 mime="text/csv",
                 icon=":material/download:",
                 width="stretch"
@@ -349,7 +312,7 @@ if res_state:
             st.download_button(
                 label="Download Excel",
                 data=excel_buf.getvalue(),
-                file_name=f"apple_music_checker_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+                file_name=f"apple_music_exact_matches_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 icon=":material/table_view:",
                 width="stretch"
