@@ -1,4 +1,4 @@
-"""streamlit_app.py - Apple Music Live Checker & CD Tracker Sync App."""
+"""streamlit_app.py - High-Speed Apple Music Live Checker (Manual UPC Mode)."""
 
 import io
 import re
@@ -10,9 +10,8 @@ import pandas as pd
 import streamlit as st
 
 import checker_engine
-import sheets_sync
 
-# Page configuration
+# --- PAGE SETUP ---
 st.set_page_config(
     page_title="Apple Music Live Checker",
     page_icon="🎵",
@@ -20,302 +19,274 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# Initialize Session State
-if "scan_results" not in st.session_state:
-    st.session_state["scan_results"] = None
-if "pending_items" not in st.session_state:
-    st.session_state["pending_items"] = None
-if "last_updated_count" not in st.session_state:
-    st.session_state["last_updated_count"] = None
-if "selected_rows_state" not in st.session_state:
-    st.session_state["selected_rows_state"] = {}
+# Optional Password Gate (if app_password defined in st.secrets)
+if hasattr(st, "secrets") and "app_password" in st.secrets:
+    if "authenticated" not in st.session_state:
+        st.session_state["authenticated"] = False
+
+    if not st.session_state["authenticated"]:
+        st.title("🔒 Apple Music Checker - Access Restricted")
+        col_pwd, _ = st.columns([1, 2])
+        with col_pwd:
+            input_pwd = st.text_input("Enter Access PIN / Password", type="password")
+            if st.button("Unlock App", type="primary", width="stretch"):
+                if input_pwd == str(st.secrets["app_password"]):
+                    st.session_state["authenticated"] = True
+                    st.rerun()
+                else:
+                    st.error("Incorrect password. Please try again.")
+        st.stop()
+
+# --- INITIALIZE STATE ---
+if "manual_results" not in st.session_state:
+    st.session_state["manual_results"] = None
+if "pasted_text" not in st.session_state:
+    st.session_state["pasted_text"] = ""
 
 # --- SIDEBAR CONFIGURATION ---
 with st.sidebar:
-    st.title("Configuration")
+    st.title("Settings")
     
-    st.markdown("### Google Sheets")
-    sheet_id_input = st.text_input(
-        "Tracker Sheet ID",
-        value=sheets_sync.DEFAULT_SHEET_ID,
-        help="Google Sheet ID for CD Tracker"
-    )
-    
-    target_status = st.selectbox(
-        "Status Value for Live Items",
-        options=["Uploaded", "Delivered"],
-        index=0,
-        help="Value written to Column AE for verified live releases (default: Uploaded)"
-    )
-    
-    update_apple_name_col = st.checkbox(
-        "Update Apple Music Name (Column AF)",
-        value=True,
-        help="Write verified Apple Music link/title into Column AF"
-    )
-
-    st.divider()
-    st.markdown("### Storefronts & Engine")
-    all_storefronts = {
+    st.markdown("### Storefronts")
+    available_storefronts = {
         "EG": "Egypt",
         "SA": "Saudi Arabia",
         "DZ": "Algeria",
         "AE": "United Arab Emirates",
         "US": "United States",
         "FR": "France",
-        "GB": "United Kingdom"
+        "GB": "United Kingdom",
+        "MA": "Morocco"
     }
     selected_storefronts = st.multiselect(
         "Storefronts to Scan",
-        options=list(all_storefronts.keys()),
+        options=list(available_storefronts.keys()),
         default=["EG", "US", "SA", "DZ", "AE"],
-        format_func=lambda code: f"{code} - {all_storefronts[code]}"
+        format_func=lambda code: f"{code} — {available_storefronts[code]}",
+        help="Checks catalog availability across selected storefronts"
     )
-    
+
+    st.markdown("### Performance")
     max_concurrency = st.slider(
         "Concurrent Workers",
         min_value=2,
         max_value=16,
         value=8,
-        help="Higher values scan faster but may trigger storefront rate limits"
+        help="Number of parallel threads for Apple Music API lookup"
     )
 
     st.divider()
-    # Check credentials status
-    try:
-        service_test = sheets_sync.get_sheets_service()
-        st.success("Google API Connected", icon=":material/check_circle:")
-    except Exception as e:
-        st.warning("Google API Not Connected", icon=":material/warning:")
-        st.caption(f"Error: {e}")
+    st.caption("Apple Music Live Checker • Manual UPC Mode")
 
 # --- APP HEADER ---
 st.title("🎵 Apple Music Live Checker")
 st.caption(
-    "Verify whether distributed releases are live on Apple Music by UPC and synchronize their status to 'Uploaded' in the CD Tracker Google Sheet."
+    "Paste UPCs or upload a spreadsheet to instantly verify availability on Apple Music across global storefronts."
 )
 
-# --- WORKFLOW TABS ---
-input_mode = st.segmented_control(
-    "Select Workflow",
-    options=["CD Tracker Pending", "Paste UPCs / Manual Input"],
-    default="CD Tracker Pending"
-)
+# --- INPUT SECTION ---
+with st.container(border=True):
+    col_input, col_file = st.columns([1.2, 1], gap="medium")
 
-# -------------------------------------------------------------
-# MODE 1: CD TRACKER PENDING
-# -------------------------------------------------------------
-if input_mode == "CD Tracker Pending":
-    st.markdown("#### Scan Pending Releases from CD Tracker")
-    st.caption("Fetches all rows currently marked as 'Pending' in '2026_Tickets' and 'New Releases 2026'.")
-    
-    col_fetch, col_scan = st.columns([1, 1], vertical_alignment="bottom")
-    with col_fetch:
-        if st.button("Fetch Pending from Sheet", icon=":material/sync:", width="stretch"):
-            with st.spinner("Connecting to Google Sheets..."):
-                try:
-                    pending = sheets_sync.fetch_pending_from_sheet(sheet_id=sheet_id_input)
-                    st.session_state["pending_items"] = pending
-                    st.session_state["scan_results"] = None
-                    st.toast(f"Fetched {len(pending)} pending releases from Google Sheets!", icon=":material/check:")
-                except Exception as e:
-                    st.error(f"Failed to fetch pending items from Google Sheets: {e}")
-                    
-    pending_items = st.session_state.get("pending_items")
-    if pending_items:
-        tickets_count = sum(1 for it in pending_items if it.get("tab") == "2026_Tickets")
-        releases_count = sum(1 for it in pending_items if it.get("tab") == "New Releases 2026")
-        st.info(
-            f"Found **{len(pending_items)}** total pending items: **{tickets_count}** in '2026_Tickets' and **{releases_count}** in 'New Releases 2026'.",
-            icon=":material/info:"
+    with col_input:
+        st.markdown("##### Paste UPCs")
+        st.caption("Enter UPCs (one per line, comma-separated, or pasted from Excel).")
+
+        # Action buttons row above text area
+        col_s1, col_s2, _ = st.columns([1, 1, 1.5])
+        with col_s1:
+            if st.button("Load Samples", icon=":material/playlist_add:", width="stretch"):
+                # 3 sample UPCs: 1 delivered, 2 test/pending
+                sample_upcs = "730170424336\n730170440831\n730170441074\n730170424701"
+                st.session_state["pasted_text"] = sample_upcs
+                st.rerun()
+        with col_s2:
+            if st.button("Clear Input", icon=":material/clear_all:", width="stretch"):
+                st.session_state["pasted_text"] = ""
+                st.session_state["manual_results"] = None
+                st.rerun()
+
+        input_upcs = st.text_area(
+            "UPC Input",
+            value=st.session_state.get("pasted_text", ""),
+            height=180,
+            placeholder="730170424336\n730170440831\n730170441074",
+            label_visibility="collapsed"
         )
 
-        with col_scan:
-            if st.button("Start Apple Music Scan", icon=":material/search:", type="primary", width="stretch"):
-                progress_bar = st.progress(0, text="Starting scan...")
-                status_placeholder = st.empty()
+    with col_file:
+        st.markdown("##### Or Upload File")
+        st.caption("Upload a CSV or Excel file containing a 'UPC' or 'Barcode' column.")
+        uploaded_file = st.file_uploader(
+            "Upload CSV or Excel",
+            type=["csv", "xlsx", "xls"],
+            label_visibility="collapsed"
+        )
 
-                def on_progress(done, total, item):
-                    pct = int((done / total) * 100)
-                    progress_bar.progress(pct, text=f"Scanning {done}/{total} ({pct}%) - Checking {item.get('ticket', '')} ({item.get('upc', '')})")
+# Parse UPCs
+parsed_items = []
 
-                items_to_scan = [
-                    {
-                        **it,
-                        "storefronts": [s.lower() for s in selected_storefronts]
-                    }
-                    for it in pending_items
-                ]
+# 1. From Text Input
+if input_upcs.strip():
+    tokens = re.split(r'[\r\n,\t; ]+', input_upcs.strip())
+    seen = set()
+    for tok in tokens:
+        clean = re.sub(r'\D', '', tok)
+        if clean and len(clean) >= 10 and clean not in seen:
+            seen.add(clean)
+            parsed_items.append({"upc": clean, "source": "Pasted"})
 
-                start_time = time.time()
-                results = checker_engine.batch_check_upcs(
-                    items_to_scan,
-                    max_workers=max_concurrency,
-                    progress_callback=on_progress
-                )
-                duration = round(time.time() - start_time, 2)
-                
-                progress_bar.empty()
-                status_placeholder.empty()
-                st.session_state["scan_results"] = results
-                st.success(f"Scan complete in {duration} seconds!", icon=":material/verified:")
+# 2. From Uploaded File
+if uploaded_file is not None:
+    try:
+        if uploaded_file.name.endswith(".csv"):
+            df_file = pd.read_csv(uploaded_file)
+        else:
+            df_file = pd.read_excel(uploaded_file)
 
-# -------------------------------------------------------------
-# MODE 2: PASTE UPCS / MANUAL INPUT
-# -------------------------------------------------------------
-else:
-    st.markdown("#### Paste UPCs or Upload File")
-    raw_text = st.text_area(
-        "Paste UPCs (one per line, or comma-separated)",
-        height=150,
-        placeholder="730170424336\n730170424701\n730170425326"
+        # Detect UPC column
+        col_candidates = [c for c in df_file.columns if any(k in str(c).lower() for k in ["upc", "barcode", "ean", "catalog"])]
+        target_col = col_candidates[0] if col_candidates else df_file.columns[0]
+
+        file_seen = set(it["upc"] for it in parsed_items)
+        file_count = 0
+        for _, row in df_file.iterrows():
+            val = str(row[target_col]).split(".")[0].strip()
+            clean = re.sub(r'\D', '', val)
+            if clean and len(clean) >= 10 and clean not in file_seen:
+                file_seen.add(clean)
+                parsed_items.append({
+                    "upc": clean,
+                    "source": f"File ({uploaded_file.name})"
+                })
+                file_count += 1
+        st.success(f"Loaded **{file_count}** unique UPCs from `{uploaded_file.name}` (Column: `{target_col}`)", icon=":material/check_circle:")
+    except Exception as e:
+        st.error(f"Error reading file: {e}", icon=":material/error:")
+
+# --- SCAN TRIGGER ---
+col_run, col_info = st.columns([1, 2], vertical_alignment="center")
+
+with col_run:
+    scan_clicked = st.button(
+        f"Check Apple Music ({len(parsed_items)} UPCs)" if parsed_items else "Check Apple Music Availability",
+        type="primary",
+        disabled=len(parsed_items) == 0,
+        icon=":material/search:",
+        width="stretch"
     )
 
-    uploaded_file = st.file_uploader("Or upload CSV / Excel with a 'UPC' column", type=["csv", "xlsx"])
-    
-    col_manual_run, _ = st.columns([1, 2], vertical_alignment="bottom")
-    with col_manual_run:
-        if st.button("Scan Pasted UPCs", icon=":material/search:", type="primary", width="stretch"):
-            upc_list = []
-            if raw_text.strip():
-                # Extract all numeric strings between 10 and 15 digits
-                tokens = re.split(r'[\r\n,\t; ]+', raw_text.strip())
-                for tok in tokens:
-                    clean = re.sub(r'\D', '', tok)
-                    if clean and len(clean) >= 10:
-                        upc_list.append({"upc": clean, "ticket": "Manual Input", "artist": "", "title": ""})
-            
-            if uploaded_file is not None:
-                try:
-                    if uploaded_file.name.endswith(".csv"):
-                        df_upload = pd.read_csv(uploaded_file)
-                    else:
-                        df_upload = pd.read_excel(uploaded_file)
-                    
-                    # Look for UPC column
-                    col_found = next((c for c in df_upload.columns if "upc" in str(c).lower()), None)
-                    if col_found:
-                        for _, row in df_upload.iterrows():
-                            val = str(row[col_found]).split(".")[0].strip()
-                            clean = re.sub(r'\D', '', val)
-                            if clean and len(clean) >= 10:
-                                upc_list.append({
-                                    "upc": clean,
-                                    "ticket": str(row.get("Ticket Number", "File Upload")),
-                                    "artist": str(row.get("Artist", "")),
-                                    "title": str(row.get("Title", ""))
-                                })
-                    else:
-                        st.error("Uploaded file must have a column containing 'UPC'")
-                except Exception as e:
-                    st.error(f"Error reading file: {e}")
+with col_info:
+    if parsed_items:
+        st.caption(f"Ready to check **{len(parsed_items)}** unique UPCs across **{len(selected_storefronts)}** storefronts.")
 
-            if not upc_list:
-                st.warning("Please paste at least one valid UPC or upload a file.")
-            else:
-                progress_bar = st.progress(0, text="Starting scan...")
-                def on_progress(done, total, item):
-                    pct = int((done / total) * 100)
-                    progress_bar.progress(pct, text=f"Scanning {done}/{total} ({pct}%) - UPC: {item.get('upc', '')}")
+if scan_clicked and parsed_items:
+    storefront_list = [s.lower() for s in selected_storefronts]
+    scan_payload = [
+        {
+            "upc": it["upc"],
+            "source": it.get("source", "Manual"),
+            "storefronts": storefront_list
+        }
+        for it in parsed_items
+    ]
 
-                items_to_scan = [
-                    {
-                        **it,
-                        "storefronts": [s.lower() for s in selected_storefronts]
-                    }
-                    for it in upc_list
-                ]
+    progress_bar = st.progress(0, text="Initiating scan...")
+    status_text = st.empty()
 
-                start_time = time.time()
-                results = checker_engine.batch_check_upcs(
-                    items_to_scan,
-                    max_workers=max_concurrency,
-                    progress_callback=on_progress
-                )
-                duration = round(time.time() - start_time, 2)
-                progress_bar.empty()
-                st.session_state["scan_results"] = results
-                st.success(f"Scanned {len(results)} UPCs in {duration} seconds!", icon=":material/verified:")
+    def on_progress(done, total, item):
+        pct = int((done / total) * 100)
+        progress_bar.progress(pct, text=f"Checking {done}/{total} ({pct}%) — UPC: {item.get('upc', '')}")
 
-# -------------------------------------------------------------
-# RESULTS SECTION
-# -------------------------------------------------------------
-results = st.session_state.get("scan_results")
+    start_t = time.time()
+    results = checker_engine.batch_check_upcs(
+        scan_payload,
+        max_workers=max_concurrency,
+        progress_callback=on_progress
+    )
+    elapsed = round(time.time() - start_t, 2)
+    progress_bar.empty()
+    status_text.empty()
 
-if results:
+    st.session_state["manual_results"] = {
+        "items": results,
+        "elapsed": elapsed,
+        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    }
+    st.toast(f"Checked {len(results)} UPCs in {elapsed}s!", icon=":material/verified:")
+
+# --- RESULTS SECTION ---
+res_state = st.session_state.get("manual_results")
+
+if res_state:
+    results_list = res_state["items"]
+    elapsed_time = res_state["elapsed"]
+    scan_time = res_state["timestamp"]
+
+    total = len(results_list)
+    live_count = sum(1 for r in results_list if r.get("is_live"))
+    not_live_count = total - live_count
+    live_pct = round((live_count / total * 100), 1) if total > 0 else 0.0
+    speed = round(total / elapsed_time, 1) if elapsed_time > 0 else 0.0
+
     st.divider()
-    st.subheader("Scan Results")
+    st.subheader("Verification Results")
 
-    total_scanned = len(results)
-    live_count = sum(1 for r in results if r.get("is_live"))
-    not_live_count = total_scanned - live_count
-    live_pct = round((live_count / total_scanned * 100), 1) if total_scanned > 0 else 0.0
-
-    # Summary Metrics
+    # Metrics Row
     m1, m2, m3, m4 = st.columns(4)
     with m1:
-        st.metric("Total Scanned", f"{total_scanned}")
+        st.metric("Total Checked", f"{total}")
     with m2:
         st.metric("Live on Apple Music", f"{live_count}", delta=f"{live_pct}% Live", delta_color="normal")
     with m3:
-        st.metric("Not Live / Pending", f"{not_live_count}", delta=f"{round(100 - live_pct, 1)}%", delta_color="inverse")
+        st.metric("Not Live / Unavailable", f"{not_live_count}", delta=f"{round(100 - live_pct, 1)}%", delta_color="inverse")
     with m4:
-        can_update_sheet = any(r.get("tab") and r.get("row") for r in results if r.get("is_live"))
-        st.metric("Sheet Update Ready", f"{live_count if can_update_sheet else 0} Rows")
+        st.metric("Scan Speed", f"{speed} UPCs/sec", delta=f"{elapsed_time}s total")
 
-    # Table Filter
-    filter_choice = st.segmented_control(
+    # Filter Segmented Control
+    filter_mode = st.segmented_control(
         "Filter View",
-        options=["All Items", "Live Only", "Not Live Only"],
-        default="All Items"
+        options=[
+            f"All ({total})",
+            f"Live Only ({live_count})",
+            f"Not Live Only ({not_live_count})"
+        ],
+        default=f"All ({total})"
     )
 
-    # Prepare DataFrame
-    table_data = []
-    for idx, r in enumerate(results):
+    # Filter data
+    filtered_rows = []
+    for r in results_list:
         is_live = bool(r.get("is_live"))
-        
-        # Filter check
-        if filter_choice == "Live Only" and not is_live:
+        if "Live Only" in filter_mode and not is_live:
             continue
-        if filter_choice == "Not Live Only" and is_live:
+        if "Not Live Only" in filter_mode and is_live:
             continue
 
-        table_data.append({
-            "_idx": idx,
-            "Update Sheet": is_live and bool(r.get("tab") and r.get("row")),
+        filtered_rows.append({
             "Status": "🟢 Live" if is_live else "🔴 Not Live",
+            "Artwork": r.get("artwork_url", ""),
             "UPC": str(r.get("upc", "")),
-            "Ticket": str(r.get("ticket", "")),
-            "Original Title": str(r.get("title", "")),
-            "Original Artist": str(r.get("artist", "")),
-            "Matched Title": str(r.get("matched_title", "")),
-            "Matched Artist": str(r.get("matched_artist", "")),
-            "Matched Album": str(r.get("matched_album", "")),
-            "Apple Music Link": str(r.get("apple_url", "")),
-            "Storefront": str(r.get("storefront", "")),
-            "Confidence": str(r.get("confidence", "")),
-            "Tab": str(r.get("tab", "")),
-            "Row": r.get("row", "")
+            "Track Title": r.get("matched_title", ""),
+            "Artist": r.get("matched_artist", ""),
+            "Album": r.get("matched_album", ""),
+            "Apple Music Link": r.get("apple_url", ""),
+            "Storefront": r.get("storefront", ""),
+            "Copyright": r.get("copyright", ""),
+            "Release Date": r.get("release_date", ""),
+            "Method": r.get("method", "")
         })
 
-    df_view = pd.DataFrame(table_data)
+    df_display = pd.DataFrame(filtered_rows)
 
-    if not df_view.empty:
-        # Selection and Edit controls
-        st.caption("Review results below. Check or uncheck releases before updating the tracker sheet.")
-        
-        edited_df = st.data_editor(
-            df_view,
+    if not df_display.empty:
+        st.dataframe(
+            df_display,
             column_config={
-                "Update Sheet": st.column_config.CheckboxColumn(
-                    "Update Sheet",
-                    help="Check to include this row in the sheet update to 'Uploaded'",
-                    default=True
-                ),
-                "Apple Music Link": st.column_config.LinkColumn(
-                    "Apple Music Link",
-                    display_text="View Track"
+                "Artwork": st.column_config.ImageColumn(
+                    "Artwork",
+                    help="Release cover artwork",
+                    width="small"
                 ),
                 "Status": st.column_config.TextColumn(
                     "Status",
@@ -324,89 +295,87 @@ if results:
                 "UPC": st.column_config.TextColumn(
                     "UPC",
                     width="medium"
+                ),
+                "Track Title": st.column_config.TextColumn(
+                    "Track Title",
+                    width="medium"
+                ),
+                "Artist": st.column_config.TextColumn(
+                    "Artist",
+                    width="medium"
+                ),
+                "Apple Music Link": st.column_config.LinkColumn(
+                    "Apple Music Link",
+                    display_text="Open in Apple Music",
+                    width="medium"
+                ),
+                "Storefront": st.column_config.TextColumn(
+                    "Storefront",
+                    width="small"
+                ),
+                "Release Date": st.column_config.TextColumn(
+                    "Release Date",
+                    width="small"
                 )
             },
-            disabled=[c for c in df_view.columns if c != "Update Sheet"],
             hide_index=True,
-            width="stretch",
-            key="results_data_editor"
+            width="stretch"
         )
 
-        # -------------------------------------------------------------
-        # DRY RUN & SHEET UPDATE ACTION BAR
-        # -------------------------------------------------------------
+        # --- EXPORT & COPY ACTIONS ---
         st.divider()
-        st.subheader("Update CD Tracker Sheet")
+        st.markdown("##### Export Results")
 
-        # Determine which items are selected for update
-        selected_for_update = []
-        if edited_df is not None and not edited_df.empty:
-            for _, row in edited_df.iterrows():
-                if row.get("Update Sheet") and row.get("Tab") and row.get("Row"):
-                    orig_idx = row.get("_idx")
-                    selected_for_update.append(results[orig_idx])
+        col_dl_csv, col_dl_excel, _ = st.columns([1, 1, 2])
 
-        if selected_for_update:
-            st.info(
-                f"**Dry Run Preview**: **{len(selected_for_update)}** release(s) selected for synchronization.\n\n"
-                f"- **Target Sheet ID**: `{sheet_id_input}`\n"
-                f"- **Status Target**: Column AE will be updated to **`{target_status}`**\n"
-                f"- **Apple Music Name / Link**: Column AF will be updated: **{'Yes' if update_apple_name_col else 'No'}**",
-                icon=":material/visibility:"
+        # CSV Export
+        with col_dl_csv:
+            csv_buf = io.StringIO()
+            pd.DataFrame(results_list).to_csv(csv_buf, index=False, encoding="utf-8-sig")
+            st.download_button(
+                label="Download CSV",
+                data=csv_buf.getvalue(),
+                file_name=f"apple_music_checker_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                mime="text/csv",
+                icon=":material/download:",
+                width="stretch"
             )
 
-            # Confirmation and Action
-            col_confirm, col_action = st.columns([1, 1], vertical_alignment="bottom")
-            with col_confirm:
-                confirm_check = st.checkbox(
-                    "I confirm these releases are live and approve updating the live CD Tracker Google Sheet.",
-                    value=False
+        # Excel Export
+        with col_dl_excel:
+            excel_buf = io.BytesIO()
+            with pd.ExcelWriter(excel_buf, engine="openpyxl") as writer:
+                pd.DataFrame(results_list).to_excel(writer, index=False, sheet_name="Results")
+            st.download_button(
+                label="Download Excel",
+                data=excel_buf.getvalue(),
+                file_name=f"apple_music_checker_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                icon=":material/table_view:",
+                width="stretch"
+            )
+
+        # Quick Copy Expanders
+        live_upcs_only = [str(r.get("upc", "")) for r in results_list if r.get("is_live")]
+        not_live_upcs_only = [str(r.get("upc", "")) for r in results_list if not r.get("is_live")]
+
+        with st.expander("📋 Copy Live UPCs / Not Live UPCs"):
+            c_live, c_not = st.columns(2)
+            with c_live:
+                st.markdown(f"**Live UPCs ({len(live_upcs_only)})**")
+                st.text_area(
+                    "Live UPCs",
+                    value="\n".join(live_upcs_only),
+                    height=120,
+                    label_visibility="collapsed"
                 )
-
-            with col_action:
-                update_btn = st.button(
-                    f"Update {len(selected_for_update)} Releases in CD Tracker",
-                    type="primary",
-                    disabled=not confirm_check,
-                    icon=":material/cloud_upload:",
-                    width="stretch"
+            with c_not:
+                st.markdown(f"**Not Live UPCs ({len(not_live_upcs_only)})**")
+                st.text_area(
+                    "Not Live UPCs",
+                    value="\n".join(not_live_upcs_only),
+                    height=120,
+                    label_visibility="collapsed"
                 )
-
-            if update_btn and confirm_check:
-                with st.spinner("Executing atomic batch update to Google Sheet..."):
-                    try:
-                        update_res = sheets_sync.batch_update_sheet_status(
-                            sheet_id=sheet_id_input,
-                            items_to_update=selected_for_update,
-                            target_status=target_status,
-                            update_apple_name=update_apple_name_col
-                        )
-                        st.session_state["last_updated_count"] = update_res.get("updated_count", 0)
-                        st.success(
-                            f"Successfully updated **{update_res.get('updated_count')}** rows in CD Tracker! "
-                            f"(Total cells updated: {update_res.get('total_cells_updated')})",
-                            icon=":material/task_alt:"
-                        )
-                        st.balloons()
-                    except Exception as e:
-                        st.error(f"Failed to update Google Sheet: {e}", icon=":material/error:")
-        else:
-            st.info("No live releases with sheet tab/row locations are currently selected for update.")
-
-        # -------------------------------------------------------------
-        # EXPORT CSV
-        # -------------------------------------------------------------
-        st.divider()
-        csv_buffer = io.StringIO()
-        export_df = pd.DataFrame(results)
-        export_df.to_csv(csv_buffer, index=False, encoding="utf-8-sig")
-        
-        st.download_button(
-            label="Download Scan Results (CSV)",
-            data=csv_buffer.getvalue(),
-            file_name=f"apple_music_scan_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-            mime="text/csv",
-            icon=":material/download:"
-        )
     else:
         st.info("No items match the selected filter.")
